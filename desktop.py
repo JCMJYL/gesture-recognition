@@ -1,14 +1,13 @@
 """Local desktop front end for gesture3."""
 
 from concurrent.futures import ThreadPoolExecutor
-import argparse
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
 
-from gesture3 import CHANNELS, DEFAULT_MODEL, NAMES, load_model, match, match_sequence, read_wave
+from gesture3 import CHANNELS, NAMES, match, match_sequence, read_wave, train
 
 BG, INK, MUTED, LINE = '#f3f5f6', '#162727', '#536268', '#d9e1e3'
 ACCENT = '#146654'
@@ -21,15 +20,17 @@ def candidate_label(candidate):
 
 
 class App:
-    def __init__(self, root, model):
-        self.root, self.model = root, model
+    def __init__(self, root):
+        self.root, self.model = root, None
         self.pool = ThreadPoolExecutor(max_workers=1)
         self.paths, self.waves = [None]*3,[None]*3
         self.pending = None
+        self.pending_kind = None
         self.result = None
         self.mode = tk.IntVar(value=0)
         self.answer = tk.StringVar(value='—')
         self.status = tk.StringVar(value='等待导入')
+        self.reference_status = tk.StringVar(value='未导入')
         root.title('A–Z 压电手势识别')
         root.geometry('1100x735')
         root.minsize(930, 650)
@@ -47,6 +48,15 @@ class App:
         header = tk.Frame(root,bg=BG)
         header.pack(fill='x',padx=24,pady=(16,12))
         tk.Label(header,text='压电手势识别',font=('Microsoft YaHei UI',19,'bold'),bg=BG,fg=INK).pack(side='left')
+        references=tk.Frame(header,bg=BG)
+        references.pack(side='right')
+        tk.Label(references,text='参考信号',bg=BG,fg=INK).pack(side='left',padx=(0,8))
+        self.reference_mode=ttk.Combobox(references,values=('每路写一次','每路同字三次'),state='readonly',width=13)
+        self.reference_mode.current(0)
+        self.reference_mode.pack(side='left',padx=(0,8))
+        self.reference_button=ttk.Button(references,text='导入 A–Z',command=self.choose_reference)
+        self.reference_button.pack(side='left',padx=(0,8))
+        tk.Label(references,textvariable=self.reference_status,bg=BG,fg=MUTED,width=21,anchor='w').pack(side='left')
 
         main = tk.Frame(root,bg=BG)
         main.pack(fill='both',expand=True,padx=24,pady=(0,19))
@@ -60,7 +70,7 @@ class App:
         def heading(parent,text):
             tk.Label(parent,text=text,bg='white',fg=INK,font=('Microsoft YaHei UI',11,'bold')).pack(anchor='w',padx=15,pady=(11,3))
 
-        heading(left,'通道文件')
+        heading(left,'待识别信号')
         self.file_labels, self.selectors = [],[]
         for i,(ch,name,col) in enumerate(zip(CHANNELS,NAMES,COLORS)):
             row = tk.Frame(left,bg='white')
@@ -114,6 +124,26 @@ class App:
         self.canvas.bind('<Configure>',lambda _event:self.draw())
         self.reset_result()
 
+    def choose_reference(self):
+        folder=filedialog.askdirectory(title='选择包含 A–Z 子文件夹的参考信号目录',parent=self.root,mustexist=True)
+        if folder:
+            self.build_reference(Path(folder),3 if self.reference_mode.current()==1 else 1)
+
+    def build_reference(self,folder,repeats):
+        if self.pending is not None:
+            return
+        self.model=None
+        self.paths,self.waves=[None]*3,[None]*3
+        for field in self.file_labels:
+            field.configure(text='未导入')
+        self.reset_result()
+        self.reference_status.set('正在建立参考库…')
+        self.status.set('正在读取 A–Z 参考信号')
+        self.pending_kind='reference'
+        self.pending=self.pool.submit(train,folder,recording_repeats=repeats)
+        self.refresh_controls()
+        self.root.after(30,self.poll)
+
     def choose(self,i):
         name = filedialog.askopenfilename(title=f'{CHANNELS[i]} {NAMES[i]}',filetypes=FILENAMES,parent=self.root)
         if not name:
@@ -126,6 +156,8 @@ class App:
         self.status.set('已复制结果')
 
     def set_files(self, paths):
+        if self.model is None or self.pending is not None:
+            return False
         try:
             assigned = [paths.get(i,p) for i,p in enumerate(self.paths)]
             chosen = [p.resolve() for p in assigned if p is not None]
@@ -153,34 +185,54 @@ class App:
         self.table.delete(*self.table.get_children())
         self.votes.configure(text='')
         ready = all(w is not None for w in self.waves)
-        self.status.set('待识别' if ready else '等待导入')
-        self.go.configure(state='normal' if ready else 'disabled')
+        self.status.set('待识别' if ready else '等待导入' if self.model is not None else '未建立参考库')
+        self.refresh_controls()
         self.draw()
 
+    def refresh_controls(self):
+        idle=self.pending is None
+        enabled=idle and self.model is not None
+        self.reference_button.configure(state='normal' if idle else 'disabled')
+        self.reference_mode.configure(state='readonly' if idle else 'disabled')
+        for b in self.selectors:
+            b.configure(state='normal' if enabled else 'disabled')
+        self.go.configure(state='normal' if enabled and all(w is not None for w in self.waves) else 'disabled')
+
     def run(self):
-        if self.pending is not None or not all(w is not None for w in self.waves):
+        if self.model is None or self.pending is not None or not all(w is not None for w in self.waves):
             return
         mode=self.mode.get()
         self.reset_result()
         self.status.set('匹配中…')
-        for b in [*self.selectors,self.go]: b.configure(state='disabled')
         waves=tuple(self.waves)
+        self.pending_kind='recognition'
         self.pending = self.pool.submit(match_sequence,self.model,waves) if mode==0 else self.pool.submit(match,self.model,waves,mode)
+        self.refresh_controls()
         self.root.after(30,self.poll)
 
     def poll(self):
         if not self.pending.done():
             self.root.after(30,self.poll)
             return
-        for b in [*self.selectors,self.go]: b.configure(state='normal')
         pending,self.pending = self.pending,None
+        kind,self.pending_kind=self.pending_kind,None
         try:
             result = pending.result()
         except Exception as exc:
-            self.answer.set('无法确定')
-            self.answer_field.configure(fg='#8a3c29')
+            if kind=='reference':
+                self.reference_status.set('导入失败')
+            else:
+                self.answer.set('无法确定')
+                self.answer_field.configure(fg='#8a3c29')
             self.status.set(str(exc))
+            self.refresh_controls()
             return
+        if kind=='reference':
+            self.model=result
+            self.reference_status.set(f'26 字母 · {len(result.shapes)} 条参考')
+            self.reset_result()
+            return
+        self.refresh_controls()
         self.result = result
         if 'positions' in result:
             self.show_spelling(result)
@@ -270,16 +322,6 @@ class App:
 
 
 if __name__=='__main__':
-    parser = argparse.ArgumentParser(description='A-Z 压电手势识别桌面程序')
-    parser.add_argument('--model',type=Path,default=DEFAULT_MODEL)
-    args = parser.parse_args()
     root = tk.Tk()
-    try:
-        model = load_model(args.model)
-    except Exception as exc:
-        root.withdraw()
-        messagebox.showerror('模板不可用',str(exc),parent=root)
-        root.destroy()
-    else:
-        App(root,model)
-        root.mainloop()
+    App(root)
+    root.mainloop()

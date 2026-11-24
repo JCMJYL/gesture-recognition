@@ -6,24 +6,16 @@ import argparse
 import csv
 import json
 import re
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from string import ascii_uppercase
 
 import numpy as np
 
-HERE = Path(__file__).resolve().parent
-LOCAL_RUNTIME = HERE.parent / 'work' / 'gesture_runtime'
-if LOCAL_RUNTIME.is_dir():
-    sys.path.append(str(LOCAL_RUNTIME))
 from dtaidistance import dtw
 
 CHANNELS = 'PRD'
 NAMES = ('掌侧', '桡侧', '背侧')
-ORIGINAL_MODEL = HERE / 'AZ_templates.npz'
-REFINED_MODEL = HERE / 'AZ_templates_refined.npz'
-DEFAULT_MODEL = REFINED_MODEL if REFINED_MODEL.is_file() else ORIGINAL_MODEL
 SIZE = 96
 RATE = 100
 VERSION = 1
@@ -229,21 +221,80 @@ def search_windows(wave,repeats):
     return [alternatives(t,x,env,a,b) for a,b in zip(bounds,bounds[1:])]
 
 
-def train(root, source):
-    labels, channels, shapes = [], [], []
-    root = Path(root)
+def reference_files(root):
+    """Index user-labeled inputs; do not derive a letter from an unlabeled query."""
+    root=Path(root)
+    if not root.is_dir():
+        raise InputError('请选择包含 A 至 Z 子文件夹的目录')
+    entries={}
+    missing=[]
     for letter in ascii_uppercase:
-        for ch in CHANNELS:
-            files = sorted(p for p in (root/letter).glob(f'{letter}_{ch}_*')
-                           if p.suffix.lower() in ('.csv','.xlsx') and re.fullmatch(r'\d+',p.stem.split('_')[-1]))
-            if len(files)<2:
-                raise InputError(f'{letter} / {ch} 至少需要两份已标注的单次文件')
-            for path in files:
-                try:
-                    shape = preprocess(read_wave(path))[0].shape
-                except InputError as exc:
-                    raise InputError(f'{path.name}：{exc}') from exc
-                labels.append(letter); channels.append(ch); shapes.append(shape)
+        found={ch:{} for ch in CHANNELS}
+        for p in sorted((root/letter).glob('*')):
+            if not p.is_file() or p.suffix.lower() not in ('.csv','.xlsx'):
+                continue
+            compact=re.fullmatch(rf'{letter}-([1-3])',p.stem,re.IGNORECASE)
+            named=re.fullmatch(rf'{letter}_([PRD])(?:_(\d+))?',p.stem,re.IGNORECASE)
+            if compact:
+                ch=CHANNELS[int(compact[1])-1]
+                index=None
+            elif named:
+                ch=named[1].upper()
+                index=int(named[2]) if named[2] is not None else None
+            else:
+                continue
+            if index in found[ch]:
+                raise InputError(f'{letter} / {ch} 参考文件重复：{found[ch][index].name}、{p.name}')
+            found[ch][index]=p
+        for ch,files in found.items():
+            if not files:
+                missing.append(f'{letter}/{ch}')
+                continue
+            if None in files and len(files)>1:
+                raise InputError(f'{letter} / {ch} 请只保留整段记录，或只保留编号的单次文件')
+            entries[letter,ch]=files
+    if missing:
+        raise InputError(f'缺少 {len(missing)} 个字母/通道的参考信号：'+ '、'.join(missing[:12]) + ('…' if len(missing)>12 else ''))
+    return entries
+
+
+def reference_shapes(wave,repeats):
+    if repeats==1:
+        return [preprocess(wave)[0].shape]
+    t,x,env=conditioned(wave)
+    bounds=quiet_boundaries(t,env)
+    groups=[alternatives(t,x,env,a,b) for a,b in zip(bounds,bounds[1:])]
+
+    def pair_cost(first,second):
+        return np.array([[dtw.distance_fast(a.shape,b.shape,window=15,penalty=.13)/np.sqrt(SIZE)
+                          + .06*abs(np.log((a.end-a.start)/(b.end-b.start)))
+                          for b,_ in second] for a,_ in first])
+
+    # Repetitions of the same letter can guide training crops before a bank exists.
+    d01=pair_cost(groups[0],groups[1])
+    d02=pair_cost(groups[0],groups[2])
+    d12=pair_cost(groups[1],groups[2])
+    loss=(d01[:,:,None]+d02[:,None,:]+d12[None,:,:])/3
+    penalties=[np.array([p for _,p in group]) for group in groups]
+    loss+=penalties[0][:,None,None]+penalties[1][None,:,None]+penalties[2][None,None,:]
+    indices=np.unravel_index(np.argmin(loss),loss.shape)
+    return [group[i][0].shape for group,i in zip(groups,indices)]
+
+
+def train(root, source='参考信号', recording_repeats=1):
+    if recording_repeats not in (1,3):
+        raise InputError('每路整段记录仅支持写一次或同字三次')
+    labels, channels, shapes = [], [], []
+    for (letter,ch),files in reference_files(root).items():
+        for index,path in files.items():
+            repeats=recording_repeats if index is None else 1
+            try:
+                samples=reference_shapes(read_wave(path),repeats)
+            except InputError as exc:
+                raise InputError(f'{letter} / {ch}：{path.name}：{exc}') from exc
+            shapes.extend(samples)
+            labels.extend([letter]*len(samples))
+            channels.extend([ch]*len(samples))
     return Model(np.asarray(shapes),np.asarray(labels),np.asarray(channels),source)
 
 
@@ -258,7 +309,7 @@ def load_model(path):
             raise InputError('模板版本不兼容，请重新训练')
         m = Model(d['shapes'],d['labels'],d['channels'],str(d['source']))
     if (m.shapes.shape != (len(m.labels),SIZE) or m.labels.shape != m.channels.shape
-        or not np.isfinite(m.shapes).all() or any(np.sum((m.labels==l)&(m.channels==c))<2 for l in ascii_uppercase for c in CHANNELS)):
+        or not np.isfinite(m.shapes).all() or any(not np.any((m.labels==l)&(m.channels==c)) for l in ascii_uppercase for c in CHANNELS)):
         raise InputError('模板库数据不完整或无效')
     return m
 
@@ -288,7 +339,7 @@ def match(model, waves, repeats=1, *, flexible_edges=False):
             for indices in groups_by_letter:
                 nearest=np.sort(distances[:,indices],axis=1)
                 # With a larger bank, require support beyond one unusually close match.
-                weights=(.66,.25,.09) if len(indices)>=6 else (.80,.20)
+                weights=(.66,.25,.09) if len(indices)>=6 else (.80,.20) if len(indices)>=2 else (1.,)
                 scores.append(nearest[:,:len(weights)]@weights)
             scores=np.array(scores)
             best = np.argmin(scores,axis=1)
@@ -447,9 +498,11 @@ def main():
     parser = argparse.ArgumentParser(description='A-Z 压电三通道波形识别')
     sub = parser.add_subparsers(dest='command', required=True)
     p = sub.add_parser('train'); p.add_argument('dataset',type=Path)
-    p.add_argument('--model',type=Path,required=True); p.add_argument('--source',required=True)
+    p.add_argument('--model',type=Path,required=True)
+    p.add_argument('--source',default='参考信号')
+    p.add_argument('--recording-repeats',type=int,choices=(1,3),default=1)
     for action in ('predict','spell'):
-        p = sub.add_parser(action); p.add_argument('--model',type=Path,default=DEFAULT_MODEL)
+        p = sub.add_parser(action); p.add_argument('--model',type=Path,required=True)
         for name in 'prd':
             p.add_argument('--'+name,type=Path,required=True)
         if action=='predict':
@@ -459,7 +512,7 @@ def main():
         if args.command=='train':
             if args.model.exists():
                 raise InputError('模板文件已存在，请指定一个新文件名')
-            model = train(args.dataset,args.source)
+            model = train(args.dataset,args.source,args.recording_repeats)
             save_model(model,args.model)
             print(f'{len(model.labels)} 个模板，覆盖 26 字母 × 3 通道：{args.model}')
         else:

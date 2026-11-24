@@ -11,24 +11,36 @@ python -m pip install -r requirements.txt
 python desktop.py
 ```
 
-The desktop application takes three files, one per channel. Each CSV or XLSX contains elapsed time in seconds and voltage in volts, in that order. For a letter sequence, record the same sequence on each channel in the same order and leave brief pauses between letters. The channels need not be recorded simultaneously.
+## Import reference recordings first
 
-## Try the synthetic example
+Put one subfolder per letter (`A` through `Z`) under a single parent folder. Each letter must have a labeled file for each channel. All files must have two numeric columns: elapsed time in seconds, then voltage in volts. CSV and XLSX are supported.
 
-```shell
-python gesture3.py spell --p examples/HELLO/HELLO_P.csv --r examples/HELLO/HELLO_R.csv --d examples/HELLO/HELLO_D.csv
+```text
+references/
+  A/A-1.xlsx    # P
+  A/A-2.xlsx    # R
+  A/A-3.xlsx    # D
+  B/B-1.xlsx
+  B/B-2.xlsx
+  B/B-3.xlsx
+  ...
+  Z/Z-3.xlsx
 ```
 
-The example contains three independently simulated recordings of `HELLO`. `AZ_templates_refined.npz` contains 702 simulated reference waveforms: 26 letters, three channels, and nine templates per letter and channel. Neither the bundled recordings nor the reference waveforms are experimental measurements. Performance on these files is not evidence of real-world recognition accuracy.
+In the desktop window, select whether each file contains one writing of the letter or three consecutive writings of the same letter. Click **导入 A–Z** and select `references/`, not an individual letter folder. For individual, already segmented trials, filenames such as `A_P_01.csv`, `A_P_02.csv`, `A_R_01.csv`, and `A_D_01.csv` are also supported. The reference bank is built locally for the current session. No data are sent to a server.
 
-## Build templates from new recordings
+## Recognize new recordings
 
-Organize single-gesture captures in one directory per letter (A through Z). For example, use `trials/A/A_P_01.csv`, `trials/A/A_P_02.csv`, and corresponding `A_R_*` and `A_D_*` files. Provide at least two labeled captures per letter and channel; do not use continuous words or unsegmented repeat recordings as individual templates.
+Once all 26 letters and three channels are loaded, select three separate query files in the **待识别信号** section, one each for P, R, and D. For a letter sequence, record the same sequence on each channel in the same order and leave brief pauses between letters. The channels need not be recorded simultaneously. Keep query recordings separate from labeled reference recordings when evaluating accuracy.
+
+## Command line
 
 ```shell
-python gesture3.py train trials --source "Measured templates" --model measured_v1.npz
-python desktop.py --model measured_v1.npz
+python gesture3.py train references --recording-repeats 1 --model local_reference.npz
+python gesture3.py spell --model local_reference.npz --p query_p.csv --r query_r.csv --d query_d.csv
 ```
+
+Use `--recording-repeats 3` for full reference records that contain three writings of the same letter. `train` is the only command that saves a template file; the desktop application keeps its reference bank in memory.
 
 The software segments each channel independently, compares signed waveform shapes with dynamic time warping, and combines evidence across channels in writing order. Match percentages summarize waveform fit, not statistical probabilities. Uncertain positions are marked `?`; incompatible channel segmentations may be rejected rather than forced into a word.
 
@@ -37,7 +49,5 @@ The software segments each channel independently, compares signed waveform shape
 - `gesture3.py`: input, preprocessing, segmentation, template training, and recognition
 - `desktop.py`: desktop interface and waveform display
 - `requirements.txt`: Python dependencies
-- `AZ_templates_refined.npz`: simulated template bank
-- `examples/HELLO/`: three simulated example traces
 
 For reproducibility, cite the specific release used in your work rather than the changing default branch.
