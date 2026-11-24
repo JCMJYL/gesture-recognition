@@ -1,3 +1,0 @@
-numpy
-dtaidistance==2.4.0
-openpyxl
